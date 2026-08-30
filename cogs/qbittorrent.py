@@ -95,6 +95,87 @@ def torrent_value(torrent, key, default=None):
     return getattr(torrent, key, default)
 
 
+def is_torrent_paused(torrent):
+    state = str(torrent_value(torrent, "state", "")).lower()
+    return state.startswith("paused") or state.startswith("stopped")
+
+
+class QBittorrentControlView(discord.ui.View):
+    def __init__(self, cog, torrent_hash, paused=False):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.torrent_hash = torrent_hash
+        self.paused = paused
+        self.pause_button.emoji = self._pause_emoji()
+
+    def _pause_emoji(self):
+        if self.paused:
+            return "\N{BLACK RIGHT-POINTING TRIANGLE}\ufe0f"
+        return "\N{DOUBLE VERTICAL BAR}\ufe0f"
+
+    @discord.ui.button(
+        style=discord.ButtonStyle.secondary,
+        custom_id="qbittorrent:pause",
+    )
+    async def pause_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        try:
+            if self.paused:
+                await self.cog._call(
+                    self.cog.client.torrents_resume,
+                    torrent_hashes=self.torrent_hash,
+                )
+                self.paused = False
+                action = "resumed"
+            else:
+                await self.cog._call(
+                    self.cog.client.torrents_pause,
+                    torrent_hashes=self.torrent_hash,
+                )
+                self.paused = True
+                action = "paused"
+
+            button.emoji = self._pause_emoji()
+            await interaction.response.edit_message(view=self)
+            print(f"qBittorrent torrent {action}: {self.torrent_hash}")
+        except Exception as exc:
+            print(f"Failed to toggle qBittorrent torrent: {exc}")
+            await interaction.response.send_message(
+                "Failed to update torrent state.",
+                ephemeral=True,
+            )
+
+    @discord.ui.button(
+        emoji="\N{BLACK SQUARE FOR STOP}\ufe0f",
+        style=discord.ButtonStyle.danger,
+        custom_id="qbittorrent:stop",
+    )
+    async def stop_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        try:
+            await self.cog._call(
+                self.cog.client.torrents_delete,
+                delete_files=True,
+                torrent_hashes=self.torrent_hash,
+            )
+            for item in self.children:
+                item.disabled = True
+            await interaction.response.edit_message(view=self)
+            print(f"qBittorrent torrent deleted with files: {self.torrent_hash}")
+        except Exception as exc:
+            print(f"Failed to delete qBittorrent torrent: {exc}")
+            await interaction.response.send_message(
+                "Failed to stop and delete torrent.",
+                ephemeral=True,
+            )
+
+
 class QBittorrentCog(commands.Cog):
     def __init__(self, bot, settings=None):
         self.bot = bot
@@ -107,6 +188,7 @@ class QBittorrentCog(commands.Cog):
         self._auth_lock = asyncio.Lock()
         self._logged_in = False
         self._messages = {}
+        self._views = {}
         self._pending_reactions = deque()
         self.poll_torrents.start()
 
@@ -294,10 +376,21 @@ class QBittorrentCog(commands.Cog):
                 continue
 
             embed = self._build_embed(torrent)
+            view = self._views.get(torrent_hash)
+            if view is None:
+                view = QBittorrentControlView(
+                    self,
+                    torrent_hash,
+                    paused=is_torrent_paused(torrent),
+                )
+                self._views[torrent_hash] = view
             existing_message = self._messages.get(torrent_hash)
             if existing_message is None:
                 try:
-                    self._messages[torrent_hash] = await status_channel.send(embed=embed)
+                    self._messages[torrent_hash] = await status_channel.send(
+                        embed=embed,
+                        view=view,
+                    )
                     await self._mark_next_pending_source_message()
                 except discord.HTTPException as exc:
                     print(f"Failed to send qBittorrent status message: {exc}")
@@ -305,15 +398,19 @@ class QBittorrentCog(commands.Cog):
                 continue
 
             try:
-                await existing_message.edit(embed=embed)
+                view.paused = is_torrent_paused(torrent)
+                view.pause_button.emoji = view._pause_emoji()
+                await existing_message.edit(embed=embed, view=view)
             except discord.NotFound:
                 self._messages.pop(torrent_hash, None)
+                self._views.pop(torrent_hash, None)
             except discord.HTTPException as exc:
                 print(f"Failed to edit qBittorrent status message: {exc}")
 
         stale_hashes = set(self._messages) - active_hashes
         for torrent_hash in stale_hashes:
             message = self._messages.pop(torrent_hash)
+            self._views.pop(torrent_hash, None)
             try:
                 await message.delete()
             except discord.NotFound:
