@@ -1,6 +1,8 @@
 import asyncio
 import configparser
 import re
+import time
+from collections import deque
 from urllib.parse import parse_qs, urlparse
 
 import discord
@@ -10,6 +12,7 @@ from discord.ext import commands, tasks
 
 
 MAGNET_HASH_RE = re.compile(r"^[A-Fa-f0-9]{40}$|^[A-Za-z2-7]{32}$")
+PENDING_REACTION_TIMEOUT_SECONDS = 120
 
 
 def load_qbittorrent_config():
@@ -104,6 +107,7 @@ class QBittorrentCog(commands.Cog):
         self._auth_lock = asyncio.Lock()
         self._logged_in = False
         self._messages = {}
+        self._pending_reactions = deque()
         self.poll_torrents.start()
 
     def cog_unload(self):
@@ -138,6 +142,49 @@ class QBittorrentCog(commands.Cog):
 
     async def _add_magnet(self, magnet_uri):
         return await self._call(self.client.torrents_add, urls=magnet_uri)
+
+    async def _add_source_reaction(self, message, emoji):
+        try:
+            await message.add_reaction(emoji)
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as exc:
+            print(f"Failed to add qBittorrent source reaction: {exc}")
+
+    async def _mark_next_pending_source_message(self, success=True):
+        while self._pending_reactions:
+            pending = self._pending_reactions[0]
+            if not success:
+                self._pending_reactions.popleft()
+                await self._add_source_reaction(
+                    pending["message"],
+                    "\N{WARNING SIGN}\ufe0f",
+                )
+                return
+
+            pending["remaining"] -= 1
+            if pending["remaining"] > 0:
+                return
+
+            self._pending_reactions.popleft()
+            await self._add_source_reaction(
+                pending["message"],
+                "\N{WHITE HEAVY CHECK MARK}",
+            )
+            return
+
+    async def _mark_expired_pending_source_messages(self):
+        now = time.monotonic()
+        while self._pending_reactions:
+            pending = self._pending_reactions[0]
+            if now - pending["created_at"] < PENDING_REACTION_TIMEOUT_SECONDS:
+                return
+
+            self._pending_reactions.popleft()
+            await self._add_source_reaction(
+                pending["message"],
+                "\N{WARNING SIGN}\ufe0f",
+            )
 
     def _build_embed(self, torrent):
         name = torrent_value(torrent, "name", "Unknown")
@@ -212,12 +259,17 @@ class QBittorrentCog(commands.Cog):
             except Exception as exc:
                 errors.append(f"{magnet_uri[:80]}: {exc}")
 
-        summary = []
-        if added:
-            summary.append(f"Added {len(added)} torrent(s).")
         if errors:
-            summary.append("Errors:\n" + "\n".join(errors[:5]))
-        await message.reply("\n".join(summary), mention_author=False)
+            await self._add_source_reaction(message, "\N{WARNING SIGN}\ufe0f")
+            print("qBittorrent add failed: " + " | ".join(errors[:5]))
+        elif added:
+            self._pending_reactions.append(
+                {
+                    "message": message,
+                    "remaining": len(added),
+                    "created_at": time.monotonic(),
+                }
+            )
 
     @tasks.loop(seconds=2.0)
     async def poll_torrents(self):
@@ -234,6 +286,8 @@ class QBittorrentCog(commands.Cog):
             if torrent_value(torrent, "hash")
         }
 
+        await self._mark_expired_pending_source_messages()
+
         for torrent in torrents:
             torrent_hash = str(torrent_value(torrent, "hash", ""))
             if not torrent_hash:
@@ -244,8 +298,10 @@ class QBittorrentCog(commands.Cog):
             if existing_message is None:
                 try:
                     self._messages[torrent_hash] = await status_channel.send(embed=embed)
+                    await self._mark_next_pending_source_message()
                 except discord.HTTPException as exc:
                     print(f"Failed to send qBittorrent status message: {exc}")
+                    await self._mark_next_pending_source_message(success=False)
                 continue
 
             try:
