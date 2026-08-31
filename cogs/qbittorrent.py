@@ -1,5 +1,6 @@
 import asyncio
 import configparser
+from pathlib import Path
 import re
 import time
 from collections import deque
@@ -28,6 +29,8 @@ def load_qbittorrent_config():
         "password": section.get("password"),
         "listen_channel_id": section.getint("listen_channel_id"),
         "status_channel_id": section.getint("status_channel_id"),
+        "report_channel_id": section.getint("report_channel_id"),
+        "download_path": section.get("download_path"),
     }
 
 
@@ -93,6 +96,69 @@ def torrent_value(torrent, key, default=None):
     if isinstance(torrent, dict):
         return torrent.get(key, default)
     return getattr(torrent, key, default)
+
+
+def file_value(file_info, key, default=None):
+    if isinstance(file_info, dict):
+        return file_info.get(key, default)
+    return getattr(file_info, key, default)
+
+
+def format_peer_count(value):
+    if value is None:
+        return "Unknown"
+
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return "Unknown"
+
+    if count < 0:
+        return "Unknown"
+    return str(count)
+
+
+def torrent_file_top_level_name(name):
+    parts = str(name or "").replace("\\", "/").strip("/").split("/")
+    parts = [part for part in parts if part]
+    if not parts:
+        return None
+    return parts[0]
+
+
+def completed_download_items(files):
+    items = {}
+
+    for file_info in files:
+        try:
+            priority = int(file_value(file_info, "priority", 1) or 0)
+        except (TypeError, ValueError):
+            priority = 1
+        if priority == 0:
+            continue
+
+        top_level_name = torrent_file_top_level_name(file_value(file_info, "name", ""))
+        if top_level_name is None:
+            continue
+
+        try:
+            size = int(file_value(file_info, "size", 0) or 0)
+        except (TypeError, ValueError):
+            size = 0
+
+        try:
+            progress = float(file_value(file_info, "progress", 0) or 0)
+        except (TypeError, ValueError):
+            progress = 0
+
+        item = items.setdefault(
+            top_level_name,
+            {"name": top_level_name, "size": 0, "complete": True},
+        )
+        item["size"] += size
+        item["complete"] = item["complete"] and progress >= 1
+
+    return list(items.values())
 
 
 def is_torrent_paused(torrent):
@@ -190,10 +256,16 @@ class QBittorrentCog(commands.Cog):
         self._messages = {}
         self._views = {}
         self._pending_reactions = deque()
+        self._source_requests = {}
+        self._torrent_sources = {}
+        self._pending_download_items = {}
+        self._completed_reports = {}
         self.poll_torrents.start()
+        self.poll_completed_downloads.start()
 
     def cog_unload(self):
         self.poll_torrents.cancel()
+        self.poll_completed_downloads.cancel()
 
     async def _call(self, func, *args, **kwargs):
         await self._ensure_logged_in()
@@ -233,7 +305,7 @@ class QBittorrentCog(commands.Cog):
         except discord.HTTPException as exc:
             print(f"Failed to add qBittorrent source reaction: {exc}")
 
-    async def _mark_next_pending_source_message(self, success=True):
+    async def _mark_next_pending_source_message(self, success=True, torrent_hash=None):
         while self._pending_reactions:
             pending = self._pending_reactions[0]
             if not success:
@@ -244,15 +316,22 @@ class QBittorrentCog(commands.Cog):
                 )
                 return
 
+            if torrent_hash:
+                source = self._source_requests.get(pending["source_id"])
+                if source is not None:
+                    source["torrent_hashes"].add(torrent_hash)
+                    self._torrent_sources[torrent_hash] = pending["source_id"]
+
             pending["remaining"] -= 1
             if pending["remaining"] > 0:
                 return
 
             self._pending_reactions.popleft()
-            await self._add_source_reaction(
-                pending["message"],
-                "\N{WHITE HEAVY CHECK MARK}",
-            )
+            if pending["success_reaction"]:
+                await self._add_source_reaction(
+                    pending["message"],
+                    "\N{WHITE HEAVY CHECK MARK}",
+                )
             return
 
     async def _mark_expired_pending_source_messages(self):
@@ -268,6 +347,148 @@ class QBittorrentCog(commands.Cog):
                 "\N{WARNING SIGN}\ufe0f",
             )
 
+    def _build_completed_embed(self, item):
+        embed = discord.Embed(
+            title="Download complete",
+            color=discord.Color.green(),
+        )
+        embed.add_field(name="Name", value=str(item["name"]), inline=False)
+        embed.add_field(name="Size", value=format_bytes(item["size"]), inline=True)
+        return embed
+
+    def _download_item_path(self, item):
+        return Path(self.settings["download_path"]) / item["name"]
+
+    async def _record_torrent_download_items(self, torrent_hash, torrent=None):
+        source_id = self._torrent_sources.get(torrent_hash)
+        source = self._source_requests.get(source_id)
+        if source is None:
+            return
+
+        try:
+            files = await self._call(self.client.torrents_files, torrent_hash)
+            file_count = len(files)
+            items = completed_download_items(files)
+        except Exception as exc:
+            print(f"qBittorrent files poll failed for {torrent_hash}: {exc}")
+            file_count = 0
+            items = []
+
+        if not items and file_count == 0 and torrent is not None:
+            items = [
+                {
+                    "name": torrent_value(torrent, "name", "Unknown"),
+                    "size": torrent_value(
+                        torrent,
+                        "total_size",
+                        torrent_value(torrent, "size", 0),
+                    ),
+                    "complete": False,
+                }
+            ]
+
+        for item in items:
+            report_key = (torrent_hash, item["name"])
+            source["known_items"].add(report_key)
+            source["known_torrents"].add(torrent_hash)
+            if report_key in self._completed_reports:
+                continue
+
+            self._pending_download_items[report_key] = {
+                "name": item["name"],
+                "size": item["size"],
+                "source_id": source_id,
+                "path": self._download_item_path(item),
+            }
+
+    async def _delete_message(self, message, log_context):
+        try:
+            await message.delete()
+            return True
+        except discord.NotFound:
+            return True
+        except discord.HTTPException as exc:
+            print(f"Failed to delete {log_context}: {exc}")
+            return False
+
+    async def _remove_missing_completed_reports(self):
+        for report_key, report in list(self._completed_reports.items()):
+            if report["path"].exists():
+                continue
+
+            deleted = await self._delete_message(
+                report["message"],
+                "qBittorrent completed report message",
+            )
+            if deleted:
+                self._completed_reports.pop(report_key, None)
+                source = self._source_requests.get(report["source_id"])
+                if source is not None:
+                    source["completed_items"].discard(report_key)
+
+    async def _send_completed_report(self, report_channel, torrent_hash, source_id, item):
+        report_key = (torrent_hash, item["name"])
+        if report_key in self._completed_reports:
+            return
+
+        path = self._download_item_path(item)
+        if not path.exists():
+            return
+
+        try:
+            message = await report_channel.send(embed=self._build_completed_embed(item))
+        except discord.HTTPException as exc:
+            print(f"Failed to send qBittorrent completed report: {exc}")
+            return
+
+        self._completed_reports[report_key] = {
+            "message": message,
+            "path": path,
+            "source_id": source_id,
+        }
+        source = self._source_requests.get(source_id)
+        if source is not None:
+            source["completed_items"].add(report_key)
+        self._pending_download_items.pop(report_key, None)
+
+    async def _delete_finished_source_messages(self):
+        for source_id, source in list(self._source_requests.items()):
+            if source["deleted"]:
+                continue
+            if not source["delete_when_complete"]:
+                continue
+            if not self._source_has_all_download_records(source):
+                continue
+            if not source["known_items"]:
+                continue
+            if not source["known_items"].issubset(source["completed_items"]):
+                continue
+
+            deleted = await self._delete_message(
+                source["message"],
+                "qBittorrent source message",
+            )
+            if deleted:
+                source["deleted"] = True
+
+    def _source_has_all_download_records(self, source):
+        if len(source["torrent_hashes"]) < source["expected_torrents"]:
+            return False
+        return source["torrent_hashes"].issubset(source["known_torrents"])
+
+    def _cleanup_finished_execution_records(self):
+        for source_id, source in list(self._source_requests.items()):
+            if not self._source_has_all_download_records(source):
+                continue
+            if not source["known_items"]:
+                continue
+            if not source["known_items"].issubset(source["completed_items"]):
+                continue
+
+            for torrent_hash in source["torrent_hashes"]:
+                self._torrent_sources.pop(torrent_hash, None)
+            self._source_requests.pop(source_id, None)
+
     def _build_embed(self, torrent):
         name = torrent_value(torrent, "name", "Unknown")
         state = torrent_value(torrent, "state", "unknown")
@@ -279,6 +500,10 @@ class QBittorrentCog(commands.Cog):
         upload_speed = torrent_value(torrent, "upspeed", 0)
         eta = torrent_value(torrent, "eta", 0)
         torrent_hash = torrent_value(torrent, "hash", "")
+        seeds_connected = torrent_value(torrent, "num_seeds")
+        seeds_total = torrent_value(torrent, "num_complete")
+        leechers_connected = torrent_value(torrent, "num_leechs")
+        leechers_total = torrent_value(torrent, "num_incomplete")
 
         embed = discord.Embed(
             title=name,
@@ -298,6 +523,17 @@ class QBittorrentCog(commands.Cog):
             inline=True,
         )
         embed.add_field(name="Uploaded", value=format_bytes(uploaded), inline=True)
+        embed.add_field(
+            name="Peers",
+            value=(
+                "Seeds "
+                f"{format_peer_count(seeds_connected)}/{format_peer_count(seeds_total)}\n"
+                "Leechers "
+                f"{format_peer_count(leechers_connected)}/"
+                f"{format_peer_count(leechers_total)}"
+            ),
+            inline=True,
+        )
         embed.set_footer(text=f"hash {str(torrent_hash)[:12]}")
         return embed
 
@@ -341,17 +577,31 @@ class QBittorrentCog(commands.Cog):
             except Exception as exc:
                 errors.append(f"{magnet_uri[:80]}: {exc}")
 
-        if errors:
-            await self._add_source_reaction(message, "\N{WARNING SIGN}\ufe0f")
-            print("qBittorrent add failed: " + " | ".join(errors[:5]))
-        elif added:
+        if added:
+            source_id = message.id
+            self._source_requests[source_id] = {
+                "message": message,
+                "expected_torrents": len(added),
+                "torrent_hashes": set(),
+                "known_torrents": set(),
+                "known_items": set(),
+                "completed_items": set(),
+                "deleted": False,
+                "delete_when_complete": not errors,
+            }
             self._pending_reactions.append(
                 {
                     "message": message,
+                    "source_id": source_id,
                     "remaining": len(added),
                     "created_at": time.monotonic(),
+                    "success_reaction": not errors,
                 }
             )
+
+        if errors:
+            await self._add_source_reaction(message, "\N{WARNING SIGN}\ufe0f")
+            print("qBittorrent add failed: " + " | ".join(errors[:5]))
 
     @tasks.loop(seconds=2.0)
     async def poll_torrents(self):
@@ -391,7 +641,10 @@ class QBittorrentCog(commands.Cog):
                         embed=embed,
                         view=view,
                     )
-                    await self._mark_next_pending_source_message()
+                    await self._mark_next_pending_source_message(
+                        torrent_hash=torrent_hash
+                    )
+                    await self._record_torrent_download_items(torrent_hash, torrent)
                 except discord.HTTPException as exc:
                     print(f"Failed to send qBittorrent status message: {exc}")
                     await self._mark_next_pending_source_message(success=False)
@@ -401,6 +654,7 @@ class QBittorrentCog(commands.Cog):
                 view.paused = is_torrent_paused(torrent)
                 view.pause_button.emoji = view._pause_emoji()
                 await existing_message.edit(embed=embed, view=view)
+                await self._record_torrent_download_items(torrent_hash, torrent)
             except discord.NotFound:
                 self._messages.pop(torrent_hash, None)
                 self._views.pop(torrent_hash, None)
@@ -417,6 +671,32 @@ class QBittorrentCog(commands.Cog):
                 pass
             except discord.HTTPException as exc:
                 print(f"Failed to delete qBittorrent status message: {exc}")
+
+    @tasks.loop(seconds=10.0)
+    async def poll_completed_downloads(self):
+        try:
+            report_channel = await self._get_channel(self.settings["report_channel_id"])
+        except Exception as exc:
+            print(f"qBittorrent completed report channel lookup failed: {exc}")
+            return
+
+        await self._remove_missing_completed_reports()
+
+        for (torrent_hash, _), item in list(self._pending_download_items.items()):
+            if item["path"].exists():
+                await self._send_completed_report(
+                    report_channel,
+                    torrent_hash,
+                    item["source_id"],
+                    item,
+                )
+
+        await self._delete_finished_source_messages()
+        self._cleanup_finished_execution_records()
+
+    @poll_completed_downloads.before_loop
+    async def before_poll_completed_downloads(self):
+        await self.bot.wait_until_ready()
 
     @poll_torrents.before_loop
     async def before_poll_torrents(self):
