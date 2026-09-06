@@ -11,6 +11,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 
 import discord
+from discord import app_commands
 
 from cogs.rss import RSSPollingCog, load_rss_config
 
@@ -181,22 +182,201 @@ class AniRSSCog(RSSPollingCog):
     def _matches_patterns(self, title, patterns):
         return any(pattern.search(title) for pattern in patterns)
 
+    def _read_pattern_lines(self):
+        if not self.pattern_path.exists():
+            return []
+
+        lines = self.pattern_path.read_text(encoding="utf-8").splitlines()
+        return [line.strip() for line in lines if line.strip()]
+
+    def _load_pattern_lines(self):
+        try:
+            return self._read_pattern_lines()
+        except OSError as exc:
+            print(f"Ani RSS pattern read failed for {self.pattern_path}: {exc}")
+            return []
+
+    def _save_pattern_lines(self, pattern_lines):
+        self.pattern_path.parent.mkdir(parents=True, exist_ok=True)
+        text = "\n".join(pattern_lines)
+        if text:
+            text += "\n"
+        self.pattern_path.write_text(text, encoding="utf-8")
+
+    def _parse_pattern_indexes(self, value):
+        tokens = [token for token in re.split(r"[\s,]+", value.strip()) if token]
+        if not tokens:
+            raise ValueError("Please provide at least one pattern index.")
+
+        indexes = []
+        for token in tokens:
+            try:
+                index = int(token)
+            except ValueError as exc:
+                raise ValueError(f"Invalid pattern index: {token}") from exc
+            indexes.append(index)
+
+        return sorted(set(indexes))
+
+    def _format_pattern_lines(self, pattern_lines):
+        if not pattern_lines:
+            return "No Ani RSS patterns are configured."
+
+        lines = [f"{index}: {pattern}" for index, pattern in enumerate(pattern_lines)]
+        output = "\n".join(lines)
+        max_code_block_content = 1900
+        if len(output) > max_code_block_content:
+            output = output[:max_code_block_content].rstrip() + "\n..."
+        return f"```text\n{output}\n```"
+
+    @app_commands.command(
+        name="add_ani_pattern",
+        description="Add an Ani RSS title regex pattern",
+    )
+    async def add_ani_pattern(self, interaction: discord.Interaction, pattern: str):
+        pattern_text = pattern.strip()
+        if not pattern_text:
+            await interaction.response.send_message(
+                "Pattern cannot be empty.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            re.compile(pattern_text)
+        except re.error as exc:
+            await interaction.response.send_message(
+                f"Invalid regex pattern: {exc}",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            pattern_lines = self._read_pattern_lines()
+        except OSError as exc:
+            await interaction.response.send_message(
+                f"Failed to read pattern file: {exc}",
+                ephemeral=True,
+            )
+            return
+
+        if pattern_text in pattern_lines:
+            await interaction.response.send_message(
+                f"Pattern already exists at index {pattern_lines.index(pattern_text)}.",
+                ephemeral=True,
+            )
+            return
+
+        pattern_lines.append(pattern_text)
+        try:
+            self._save_pattern_lines(pattern_lines)
+        except OSError as exc:
+            await interaction.response.send_message(
+                f"Failed to save pattern file: {exc}",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"Added Ani RSS pattern at index {len(pattern_lines) - 1}.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="list_ani_pattern",
+        description="List Ani RSS title regex patterns",
+    )
+    async def list_ani_pattern(self, interaction: discord.Interaction):
+        try:
+            pattern_lines = self._read_pattern_lines()
+        except OSError as exc:
+            await interaction.response.send_message(
+                f"Failed to read pattern file: {exc}",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            self._format_pattern_lines(pattern_lines),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="remove_ani_pattern",
+        description="Remove Ani RSS title regex patterns by index",
+    )
+    async def remove_ani_pattern(self, interaction: discord.Interaction, indexes: str):
+        try:
+            parsed_indexes = self._parse_pattern_indexes(indexes)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        try:
+            pattern_lines = self._read_pattern_lines()
+        except OSError as exc:
+            await interaction.response.send_message(
+                f"Failed to read pattern file: {exc}",
+                ephemeral=True,
+            )
+            return
+
+        if not pattern_lines:
+            await interaction.response.send_message(
+                "No Ani RSS patterns are configured.",
+                ephemeral=True,
+            )
+            return
+
+        invalid_indexes = [
+            index
+            for index in parsed_indexes
+            if index < 0 or index >= len(pattern_lines)
+        ]
+        if invalid_indexes:
+            invalid_text = ", ".join(str(index) for index in invalid_indexes)
+            await interaction.response.send_message(
+                f"Pattern index out of range: {invalid_text}",
+                ephemeral=True,
+            )
+            return
+
+        remaining_lines = [
+            pattern
+            for index, pattern in enumerate(pattern_lines)
+            if index not in parsed_indexes
+        ]
+
+        try:
+            self._save_pattern_lines(remaining_lines)
+        except OSError as exc:
+            await interaction.response.send_message(
+                f"Failed to save pattern file: {exc}",
+                ephemeral=True,
+            )
+            return
+
+        removed_text = "\n".join(
+            f"{index}: {pattern_lines[index]}" for index in parsed_indexes
+        )
+        max_code_block_content = 1600
+        if len(removed_text) > max_code_block_content:
+            removed_text = removed_text[:max_code_block_content].rstrip() + "\n..."
+
+        await interaction.response.send_message(
+            "Removed Ani RSS patterns:\n"
+            f"```text\n{removed_text}\n```\n"
+            f"Remaining patterns: {len(remaining_lines)}",
+            ephemeral=True,
+        )
+
     def _load_patterns(self):
         if not self.pattern_path.exists():
             print(f"Ani RSS pattern file does not exist: {self.pattern_path}")
             return []
 
-        try:
-            lines = self.pattern_path.read_text(encoding="utf-8").splitlines()
-        except OSError as exc:
-            print(f"Ani RSS pattern read failed for {self.pattern_path}: {exc}")
-            return []
-
         patterns = []
-        for line_number, line in enumerate(lines, start=1):
-            pattern_text = line.strip()
-            if not pattern_text:
-                continue
+        for line_number, pattern_text in enumerate(self._load_pattern_lines(), start=1):
             try:
                 patterns.append(re.compile(pattern_text))
             except re.error as exc:
