@@ -539,8 +539,7 @@ class QBittorrentCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message):
-        if message.author.bot:
-            return
+        # Accept torrent and magnet requests from all senders, including bots.
         if message.guild is None or message.guild.id != self.settings["server_id"]:
             return
         if message.channel.id != self.settings["listen_channel_id"]:
