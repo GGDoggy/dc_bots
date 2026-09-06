@@ -279,7 +279,6 @@ class AniRSSCog(RSSPollingCog):
 
         await interaction.response.send_message(
             f"Added Ani RSS pattern at index {len(pattern_lines) - 1}.",
-            ephemeral=True,
         )
 
     @app_commands.command(
@@ -367,7 +366,6 @@ class AniRSSCog(RSSPollingCog):
             "Removed Ani RSS patterns:\n"
             f"```text\n{removed_text}\n```\n"
             f"Remaining patterns: {len(remaining_lines)}",
-            ephemeral=True,
         )
 
     def _load_patterns(self):
